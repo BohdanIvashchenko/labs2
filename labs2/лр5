@@ -1,0 +1,582 @@
+import json
+import shlex
+from collections import defaultdict
+
+
+class Document:
+    """Представляє один JSON-документ."""
+
+    def __init__(self, data):
+        if not isinstance(data, dict):
+            raise ValueError("Документ повинен бути JSON-об'єктом.")
+
+        if "id" not in data:
+            raise ValueError("Документ повинен містити поле 'id'.")
+
+        self.data = data
+
+    @property
+    def id(self):
+        return self.data["id"]
+
+    def get(self, field, default=None):
+        """Отримання значення поля, у тому числі вкладеного."""
+        current = self.data
+
+        for part in field.split("."):
+            if not isinstance(current, dict) or part not in current:
+                return default
+            current = current[part]
+
+        return current
+
+    def set(self, field, value):
+        """Зміна поля, у тому числі вкладеного."""
+        parts = field.split(".")
+        current = self.data
+
+        for part in parts[:-1]:
+            if part not in current:
+                current[part] = {}
+            elif not isinstance(current[part], dict):
+                raise ValueError(
+                    f"Поле '{part}' не є вкладеним об'єктом."
+                )
+            current = current[part]
+
+        current[parts[-1]] = value
+
+    def __repr__(self):
+        return json.dumps(self.data, ensure_ascii=False, indent=2)
+
+
+class QueryEngine:
+    """Виконує пошук і агрегатні операції."""
+
+    @staticmethod
+    def compare(actual, operator, expected):
+        if operator == "=":
+            return actual == expected
+
+        if operator == "!=":
+            return actual != expected
+
+        if operator == ">":
+            return actual > expected
+
+        if operator == "<":
+            return actual < expected
+
+        if operator == ">=":
+            return actual >= expected
+
+        if operator == "<=":
+            return actual <= expected
+
+        if operator == "contains":
+            if isinstance(actual, list):
+                return expected in actual
+            if isinstance(actual, str):
+                return str(expected) in actual
+
+        raise ValueError(f"Невідомий оператор: {operator}")
+
+    @staticmethod
+    def find(documents, field, operator, value):
+        result = []
+
+        for document in documents:
+            actual = document.get(field)
+
+            if actual is None:
+                continue
+
+            try:
+                if QueryEngine.compare(actual, operator, value):
+                    result.append(document)
+            except TypeError:
+                continue
+
+        return result
+
+    @staticmethod
+    def count(documents):
+        return len(documents)
+
+    @staticmethod
+    def aggregate(documents, operation, field):
+        values = []
+
+        for document in documents:
+            value = document.get(field)
+
+            if value is None:
+                continue
+
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(
+                    f"Поле '{field}' містить нечислове значення."
+                )
+
+            values.append(value)
+
+        if operation == "count":
+            return len(documents)
+
+        if not values:
+            raise ValueError(
+                f"Немає числових значень для поля '{field}'."
+            )
+
+        if operation == "sum":
+            return sum(values)
+
+        if operation == "avg":
+            return sum(values) / len(values)
+
+        if operation == "min":
+            return min(values)
+
+        if operation == "max":
+            return max(values)
+
+        raise ValueError(f"Невідома операція: {operation}")
+
+    @staticmethod
+    def group_by(documents, field):
+        groups = defaultdict(list)
+
+        for document in documents:
+            value = document.get(field)
+
+            if isinstance(value, list):
+                value = tuple(value)
+
+            if isinstance(value, dict):
+                value = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True
+                )
+
+            groups[str(value)].append(document)
+
+        return dict(groups)
+
+
+class Collection:
+    """Колекція JSON-документів."""
+
+    def __init__(self):
+        self.documents = {}
+
+    def add(self, data):
+        document = Document(data)
+
+        if document.id in self.documents:
+            raise ValueError(
+                f"Документ з id={document.id} вже існує."
+            )
+
+        self.documents[document.id] = document
+
+    def get(self, document_id):
+        if document_id not in self.documents:
+            raise KeyError(
+                f"Документ з id={document_id} не знайдено."
+            )
+
+        return self.documents[document_id]
+
+    def delete_by_id(self, document_id):
+        if document_id not in self.documents:
+            raise KeyError(
+                f"Документ з id={document_id} не знайдено."
+            )
+
+        del self.documents[document_id]
+
+    def delete_by_condition(self, field, operator, value):
+        found = QueryEngine.find(
+            self.documents.values(),
+            field,
+            operator,
+            value
+        )
+
+        for document in found:
+            del self.documents[document.id]
+
+        return len(found)
+
+    def update(self, document_id, field, value):
+        document = self.get(document_id)
+        document.set(field, value)
+
+    def update_many(self, field, operator, condition_value,
+                    update_field, update_value):
+
+        found = QueryEngine.find(
+            self.documents.values(),
+            field,
+            operator,
+            condition_value
+        )
+
+        for document in found:
+            document.set(update_field, update_value)
+
+        return len(found)
+
+    def find(self, field, operator, value):
+        return QueryEngine.find(
+            self.documents.values(),
+            field,
+            operator,
+            value
+        )
+
+    def all(self):
+        return list(self.documents.values())
+
+    def save(self, filename):
+        data = [document.data for document in self.documents.values()]
+
+        with open(filename, "w", encoding="utf-8") as file:
+            json.dump(
+                data,
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    def load(self, filename):
+        with open(filename, "r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        if not isinstance(data, list):
+            raise ValueError(
+                "Файл повинен містити JSON-масив документів."
+            )
+
+        self.documents.clear()
+
+        for item in data:
+            self.add(item)
+
+
+def parse_value(value):
+    """Перетворення текстового значення у відповідний Python-тип."""
+
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def print_documents(documents):
+    if not documents:
+        print("Документів не знайдено.")
+        return
+
+    for document in documents:
+        print(json.dumps(
+            document.data,
+            ensure_ascii=False,
+            indent=2
+        ))
+
+
+def print_help():
+    print("""
+Доступні команди:
+
+add <json>
+    Додати документ.
+
+delete <id>
+    Видалити документ за ID.
+
+delete_where <field> <operator> <value>
+    Видалити документи за умовою.
+
+update <id> <field> <value>
+    Оновити поле документа.
+
+update_where <field> <operator> <value> <update_field> <update_value>
+    Оновити документи, які відповідають умові.
+
+find <field> <operator> <value>
+    Виконати пошук.
+
+aggregate <operation> <field>
+    Виконати агрегацію.
+    Операції: count, sum, avg, min, max.
+
+groupby <field>
+    Згрупувати документи за полем.
+
+sort <field> [asc|desc]
+    Відсортувати документи за полем.
+
+show
+    Показати всі документи.
+
+save <filename>
+    Зберегти колекцію у JSON-файл.
+
+load <filename>
+    Завантажити колекцію з JSON-файлу.
+
+help
+    Показати довідку.
+
+exit
+    Завершити програму.
+""")
+
+
+def main():
+    collection = Collection()
+
+    print("=== Спрощена документно-орієнтована БД ===")
+    print("Введіть 'help' для перегляду доступних команд.")
+
+    while True:
+        try:
+            command = input("\nDB> ").strip()
+
+            if not command:
+                continue
+
+            parts = shlex.split(command)
+            action = parts[0].lower()
+
+            if action == "exit":
+                print("Роботу завершено.")
+                break
+
+            elif action == "help":
+                print_help()
+
+            elif action == "add":
+                if len(parts) < 2:
+                    print("Помилка: вкажіть JSON-документ.")
+
+                    continue
+
+                json_text = command[len("add"):].strip()
+
+                try:
+                    data = json.loads(json_text)
+                    collection.add(data)
+                    print("Документ успішно додано.")
+                except json.JSONDecodeError as error:
+                    print(f"Некоректний JSON: {error}")
+
+            elif action == "delete":
+                if len(parts) != 2:
+                    print("Використання: delete <id>")
+                    continue
+
+                document_id = parse_value(parts[1])
+                collection.delete_by_id(document_id)
+
+                print("Документ видалено.")
+
+            elif action == "delete_where":
+                if len(parts) != 4:
+                    print(
+                        "Використання: "
+                        "delete_where <field> <operator> <value>"
+                    )
+                    continue
+
+                field = parts[1]
+                operator = parts[2]
+                value = parse_value(parts[3])
+
+                count = collection.delete_by_condition(
+                    field,
+                    operator,
+                    value
+                )
+
+                print(f"Видалено документів: {count}")
+
+            elif action == "update":
+                if len(parts) != 4:
+                    print(
+                        "Використання: update <id> <field> <value>"
+                    )
+                    continue
+
+                document_id = parse_value(parts[1])
+                field = parts[2]
+                value = parse_value(parts[3])
+
+                collection.update(
+                    document_id,
+                    field,
+                    value
+                )
+
+                print("Документ оновлено.")
+
+            elif action == "update_where":
+                if len(parts) != 6:
+                    print(
+                        "Використання: "
+                        "update_where <field> <operator> "
+                        "<value> <update_field> <update_value>"
+                    )
+                    continue
+
+                field = parts[1]
+                operator = parts[2]
+                condition_value = parse_value(parts[3])
+                update_field = parts[4]
+                update_value = parse_value(parts[5])
+
+                count = collection.update_many(
+                    field,
+                    operator,
+                    condition_value,
+                    update_field,
+                    update_value
+                )
+
+                print(f"Оновлено документів: {count}")
+
+            elif action == "find":
+                if len(parts) != 4:
+                    print(
+                        "Використання: find <field> <operator> <value>"
+                    )
+                    continue
+
+                field = parts[1]
+                operator = parts[2]
+                value = parse_value(parts[3])
+
+                result = collection.find(
+                    field,
+                    operator,
+                    value
+                )
+
+                print_documents(result)
+
+            elif action == "aggregate":
+                if len(parts) != 3:
+                    print(
+                        "Використання: aggregate <operation> <field>"
+                    )
+                    continue
+
+                operation = parts[1]
+                field = parts[2]
+
+                result = QueryEngine.aggregate(
+                    collection.all(),
+                    operation,
+                    field
+                )
+
+                print(f"Результат: {result}")
+
+            elif action == "groupby":
+                if len(parts) != 2:
+                    print("Використання: groupby <field>")
+                    continue
+
+                field = parts[1]
+
+                groups = QueryEngine.group_by(
+                    collection.all(),
+                    field
+                )
+
+                for key, documents in groups.items():
+                    print(f"\nГрупа: {key}")
+                    print(f"Кількість: {len(documents)}")
+
+                    for document in documents:
+                        print(
+                            json.dumps(
+                                document.data,
+                                ensure_ascii=False
+                            )
+                        )
+
+            elif action == "sort":
+                if len(parts) not in (2, 3):
+                    print(
+                        "Використання: sort <field> [asc|desc]"
+                    )
+                    continue
+
+                field = parts[1]
+                reverse = (
+                    len(parts) == 3
+                    and parts[2].lower() == "desc"
+                )
+
+                documents = collection.all()
+
+                documents.sort(
+                    key=lambda doc: (
+                        doc.get(field) is None,
+                        doc.get(field)
+                    ),
+                    reverse=reverse
+                )
+
+                print_documents(documents)
+
+            elif action == "show":
+                print_documents(collection.all())
+
+            elif action == "save":
+                if len(parts) != 2:
+                    print("Використання: save <filename>")
+                    continue
+
+                collection.save(parts[1])
+                print("Колекцію збережено.")
+
+            elif action == "load":
+                if len(parts) != 2:
+                    print("Використання: load <filename>")
+                    continue
+
+                collection.load(parts[1])
+                print("Колекцію завантажено.")
+
+            else:
+                print(
+                    f"Невідома команда: {action}. "
+                    "Введіть 'help'."
+                )
+
+        except KeyError as error:
+            print(f"Помилка: {error}")
+
+        except ValueError as error:
+            print(f"Помилка: {error}")
+
+        except FileNotFoundError:
+            print("Помилка: файл не знайдено.")
+
+        except json.JSONDecodeError as error:
+            print(f"Помилка JSON: {error}")
+
+        except TypeError as error:
+            print(f"Помилка типів: {error}")
+
+        except Exception as error:
+            print(f"Непередбачена помилка: {error}")
+
+
+if __name__ == "__main__":
+    main()
